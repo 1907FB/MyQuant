@@ -105,7 +105,7 @@ parser.add_argument('--pretrained', action='store_true', default=False,
                     help='Start with pretrained version of specified network (if avail)')
 parser.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
                     help='Initialize model from this checkpoint (default: none)')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
+parser.add_argument('--resume', default='minionn.pth.tar', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 parser.add_argument('--no-resume-opt', action='store_true', default=False,
                     help='prevent resume of optimizer state when resuming model')
@@ -150,9 +150,9 @@ parser.add_argument('--clip-mode', type=str, default='norm',
 # Learning rate schedule parameters
 parser.add_argument('--sched', default='step', type=str, metavar='SCHEDULER',
                     help='LR scheduler (default: "step"')
-parser.add_argument('--decay-milestones', default=[100, 150],
+parser.add_argument('--decay-milestones', default=[15],
                     help='decay milestones for MultiStep scheduler')
-parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
+parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
                     help='learning rate (default: 0.01)')
 parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                     help='learning rate noise on/off epoch percentages')
@@ -164,17 +164,17 @@ parser.add_argument('--lr-cycle-mul', type=float, default=1.0, metavar='MULT',
                     help='learning rate cycle len multiplier (default: 1.0)')
 parser.add_argument('--lr-cycle-limit', type=int, default=1, metavar='N',
                     help='learning rate cycle limit')
-parser.add_argument('--warmup-lr', type=float, default=0.0001, metavar='LR',
+parser.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
                     help='warmup learning rate (default: 0.0001)')
 parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
                     help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-parser.add_argument('--epochs', type=int, default=200, metavar='N',
+parser.add_argument('--epochs', type=int, default=20, metavar='N',
                     help='number of epochs to train (default: 2)')
 parser.add_argument('--epoch-repeats', type=float, default=0., metavar='N',
                     help='epoch repeat multiplier (number of times to repeat dataset epoch per train epoch).')
 parser.add_argument('--start-epoch', default=None, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
+parser.add_argument('--decay-epochs', type=float, default=10, metavar='N',
                     help='epoch interval to decay LR')
 parser.add_argument('--warmup-epochs', type=int, default=3, metavar='N',
                     help='epochs to warmup LR, if scheduler supports')
@@ -424,13 +424,12 @@ def get_qat_model(model, args):
 
     qconfigs = {}
 
-    if not args.quant_stagewise:
-        print('uniform quantization')
-        for m in args.qmodules:
+    for bit, (name, module) in zip(args.bit_setting,model.named_modules()):
+        if type(module)==nn.Conv2d:
             wcfg = {
                 "enable": args.wq_enable,
                 "mode": args.wq_mode if args.wq_enable else "Identity",
-                "bit": args.wq_bitw,
+                "bit": bit,
                 "thd_pos": args.wq_pos,
                 "thd_neg": args.wq_neg,
                 "all_positive": False,
@@ -442,133 +441,16 @@ def get_qat_model(model, args):
             acfg = {
                 "enable": args.aq_enable,
                 "mode": args.aq_mode if args.aq_enable else "Identity",
-                "bit": args.aq_bitw,
+                "bit": 4,
                 "thd_pos": args.aq_pos,
                 "thd_neg": args.aq_neg,
-                "all_positive": True if args.use_relu and "linear" in m else False,
+                "all_positive": True if args.use_relu and "linear" in name else False,
                 "symmetric": True,  # not args.aq_asym,
                 "per_channel": False,
                 "normalize_first": False,
                 "p2_round_scale": True,  # scaling factor is power-of-2?
             }
-            qconfigs[m] = {"weight": wcfg, "act": acfg}
-    
-
-    # fix the first layer "conv1" and the last layer "linear" to 8-bit
-    if args.quant_firstlast:
-        print('first and last layers quantization')
-        for n in args.fl_qmodules:
-            wcfg = {
-                "enable": True,
-                "mode": "LSQ",
-                "bit": 8,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,
-                "symmetric": True,  # not args.wq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            acfg = {
-                "enable": False,
-                "mode": "Identity",  # "LSQ",
-                "bit": 4,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,  # True if args.use_relu and "linear" in m else False,
-                "symmetric": True,  # not args.aq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            qconfigs[n] = {"weight": wcfg, "act": acfg}
-
-    if args.quant_stagewise:
-        print('stage-wise quantization')
-        # stage1: W6A4
-        for n in args.stage1_qmodules:
-            wcfg = {
-                "enable": True,
-                "mode": "TWN",
-                "bit": 2,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,
-                "symmetric": True,  # not args.wq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            acfg = {
-                "enable": True,
-                "mode": "LSQ",  # "LSQ",
-                "bit": 4,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,  # True if args.use_relu and "linear" in m else False,
-                "symmetric": True,  # not args.aq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            qconfigs[n] = {"weight": wcfg, "act": acfg}
-
-        # stage2: W4A4
-        for n in args.stage2_qmodules:
-            wcfg = {
-                "enable": True,
-                "mode": "TWN",
-                "bit": 4,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,
-                "symmetric": True,  # not args.wq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            acfg = {
-                "enable": True,
-                "mode": "LSQ",  # "LSQ",
-                "bit": 4,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,  # True if args.use_relu and "linear" in m else False,
-                "symmetric": True,  # not args.aq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            qconfigs[n] = {"weight": wcfg, "act": acfg}
-
-        # stage3: W2A4
-        for n in args.stage3_qmodules:
-            wcfg = {
-                "enable": True,
-                "mode": "TWN",
-                "bit": 4,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,
-                "symmetric": True,  # not args.wq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            acfg = {
-                "enable": True,
-                "mode": "LSQ",  # "LSQ",
-                "bit": 4,
-                "thd_pos": None,
-                "thd_neg": None,
-                "all_positive": False,  # True if args.use_relu and "linear" in m else False,
-                "symmetric": True,  # not args.aq_asym,
-                "per_channel": False,
-                "normalize_first": False,
-                "p2_round_scale": True,  # scaling factor is power-of-2?
-            }
-            qconfigs[n] = {"weight": wcfg, "act": acfg}
+            qconfigs[name] = {"weight": wcfg, "act": acfg}
 
     qat_model = replace_module_by_qmodule(model, qconfigs)
 
@@ -809,11 +691,10 @@ def main(args):
 
     # optionally resume from a checkpoint
     resume_epoch = None
-    if args.resume:
-        resume_epoch = resume_checkpoint(
+    resume_checkpoint(
             model, args.resume,
-            optimizer=None if args.no_resume_opt else optimizer,
-            loss_scaler=None if args.no_resume_opt else loss_scaler,
+            optimizer=None,
+            loss_scaler=None,
             log_info=args.local_rank == 0)
 
     # setup exponential moving average of model weights, SWA could be used here too
@@ -922,7 +803,7 @@ def main(args):
         )
     
     # zwx: add this data processing
-    if 'cifar' in args.dataset:
+    if 'cifar10' in args.dataset:
         dataset_train = datasets.CIFAR10(
             root=args.data_dir,
             train=True,
@@ -993,11 +874,11 @@ def main(args):
             exp_name = args.experiment
         else:
             exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
+                args.description,
                 safe_model_name(args.model),
                 str(data_config['input_size'][-1])
             ])
-        output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
+        output_dir = get_outdir(args.output if args.output else './output/eval', exp_name)
         decreasing = True if eval_metric == 'loss' else False
         saver = CheckpointSaver(
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
@@ -1236,4 +1117,19 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
 if __name__ == '__main__':
     args, args_text = parse_args()
-    main((args, args_text))
+    file = open("minionn_comm.txt")
+    comm_dict = {}
+    lines = file.readlines()
+    for i in range(0,len(lines),2):
+        if lines[i][0] == "#":
+            continue
+        percent = float(lines[i])
+        setting = lines[i+1]
+        setting = setting.split(' ')
+        setting = [int(bit) for bit in setting]
+        comm_dict[percent] = setting
+    
+    for k,v in comm_dict.items():
+        args.description = 'comm'+str(k)
+        args.bit_setting = v
+        main((args, args_text))
